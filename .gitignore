@@ -1,0 +1,25 @@
+# large dataset
+
+dataset.pt
+encrypted_traffic_burst.txt
+
+# model files
+
+models/
+*.pt
+*.pth
+*.bin
+*.ckpt
+
+# python cache
+
+**pycache**/
+*.pyc
+
+# vscode
+
+.vscode/
+
+# jupyter
+
+.ipynb_checkpoints/
