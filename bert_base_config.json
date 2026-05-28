@@ -1,1 +1,13 @@
-{"emb_size": 768, "feedforward_size": 3072, "hidden_size": 768, "hidden_act": "gelu", "heads_num": 12, "layers_num": 12, "dropout": 0.1}
+{
+  "emb_size": 768,
+  "feedforward_size": 3072,
+  "hidden_size": 768,
+  "hidden_act": "gelu",
+  "heads_num": 12,
+  "layers_num": 12,
+  "dropout": 0.1,
+  "moe_experts": 4,
+  "moe_top_k": 2,
+  "moe_balance_coef": 0.01,
+  "moe_z_loss_coef": 0.001
+}

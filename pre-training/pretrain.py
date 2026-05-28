@@ -1,4 +1,11 @@
 import argparse
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 import uer.trainer as trainer
 from uer.utils.config import load_hyperparam
@@ -30,6 +37,22 @@ def main():
     parser.add_argument("--config_path", type=str,
                         default="models/bert/base_config.json",
                         help="Config file of model hyper-parameters.")
+    parser.add_argument("--tensorboard_log_dir", type=str, default="runs/moe_pretrain",
+                        help="TensorBoard log directory.")
+    parser.add_argument("--tensorboard_param_steps", type=int, default=10,
+                        help="Specific steps to write parameter and gradient norms.")
+    parser.add_argument("--tensorboard_histogram_steps", type=int, default=200,
+                        help="Specific steps to write selected parameter histograms.")
+    parser.add_argument("--disable_tensorboard_graph", action="store_true",
+                        help="Disable TensorBoard graph tracing.")
+    parser.add_argument("--training_state_path", type=str, default=None,
+                        help="Path of the resumable training state checkpoint.")
+    parser.add_argument("--resume_training_state_path", type=str, default=None,
+                        help="Path of the training state checkpoint to resume from.")
+    parser.add_argument("--auto_resume", action="store_true",
+                        help="Resume automatically from training_state_path if it exists.")
+    parser.add_argument("--state_save_steps", type=int, default=50,
+                        help="Specific steps to save resumable training state.")
 
     # =========================
     # Training options
@@ -45,6 +68,8 @@ def main():
                         help="Specific steps to accumulate gradient.")
     parser.add_argument("--batch_size", type=int, default=2,
                         help="Training batch size (small for MoE debug).")
+    parser.add_argument("--seq_length", type=int, default=128,
+                        help="Sequence length.")
     # <<< MOE MOD
 
     parser.add_argument("--instances_buffer_size", type=int, default=25600,
@@ -92,19 +117,6 @@ def main():
                         help="Add bias on output_layer for lm target.")
 
     # =========================
-    # >>> MOE MOD: 新增 MoE 参数
-    # =========================
-    parser.add_argument("--moe_experts", type=int, default=4,
-                        help="Number of experts in MoE.")
-    parser.add_argument("--moe_top_k", type=int, default=1,
-                        help="Top-k experts per token.")
-    parser.add_argument("--moe_balance_coef", type=float, default=0.01,
-                        help="Load balance loss coefficient for MoE.")
-    parser.add_argument("--moe_z_loss_coef", type=float, default=0.001,
-                        help="Router z-loss coefficient for MoE.")
-    # <<< MOE MOD
-
-    # =========================
     # Masking options
     # =========================
     parser.add_argument("--whole_word_masking", action="store_true",
@@ -149,7 +161,7 @@ def main():
     # Load hyperparameters
     # =========================
     if args.config_path:
-        load_hyperparam(args)
+        args = load_hyperparam(args)
 
     # =========================
     # Device / distributed setup

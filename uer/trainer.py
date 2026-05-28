@@ -2,6 +2,7 @@ import time
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import os
 from torch.nn.parallel import DistributedDataParallel
 from uer.model_loader import load_model
 from uer.model_saver import save_model
@@ -13,21 +14,70 @@ from uer.utils.seed import set_seed
 import tqdm
 
 
-def unpack_loss(loss_info):
+def split_aux_loss(loss_info, expected_items):
     """
-    Compatible with MoE models:
-    - loss
-    - (loss, aux_loss)
-    - (loss, aux_loss, *others)
+    Target outputs already contain tensors such as loss, correct, denominator.
+    MoE auxiliary loss is appended as the final item by uer.models.Model.
     """
-    if isinstance(loss_info, tuple):
-        loss = loss_info[0]
-        aux_loss = None
-        if len(loss_info) > 1 and torch.is_tensor(loss_info[1]):
-            aux_loss = loss_info[1]
-        return loss, aux_loss, loss_info
-    else:
-        return loss_info, None, loss_info
+    if not isinstance(loss_info, tuple):
+        loss_info = (loss_info,)
+
+    aux_loss = None
+    if len(loss_info) > expected_items:
+        aux_loss = loss_info[-1]
+        loss_info = loss_info[:-1]
+
+    return loss_info, aux_loss
+
+
+def unwrap_model(model):
+    if hasattr(model, "module"):
+        return model.module
+    return model
+
+
+def save_training_state(model, optimizer, scheduler, step, path):
+    state = {
+        "step": step,
+        "model": unwrap_model(model).state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict()
+    }
+    torch.save(state, path)
+
+
+def load_training_state(model, optimizer, scheduler, path):
+    state = torch.load(path, map_location="cpu")
+    unwrap_model(model).load_state_dict(state["model"], strict=False)
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    return int(state.get("step", 0))
+
+
+def sanitize_tag(name):
+    return name.replace(".", "/")
+
+
+def parameter_group_name(name):
+    if "embedding" in name:
+        return "embedding"
+    if "self_attn" in name or "context_attn" in name:
+        return "attention"
+    if "feed_forward.moe.gate" in name:
+        return "moe_router"
+    if "feed_forward.moe.experts" in name:
+        return "moe_experts"
+    if "feed_forward.ff_after" in name:
+        return "moe_ff_after"
+    if "layer_norm" in name or "layer_norm" in name or name.endswith(".gamma") or name.endswith(".beta"):
+        return "layer_norm"
+    if "target" in name or "output_layer" in name or "nsp" in name or "sop" in name or "mlm" in name:
+        return "target_head"
+    return "other"
+
+
+def tensor_norm(tensor):
+    return torch.norm(tensor.detach().float()).item()
 
 
 def train_and_validate(args):
@@ -85,16 +135,22 @@ def train_and_validate(args):
 
 class Trainer(object):
     def __init__(self, args):
-        self.current_step = 1
+        self.current_step = getattr(args, "resume_step", 1)
         self.total_steps = args.total_steps
         self.accumulation_steps = args.accumulation_steps
         self.report_steps = args.report_steps
         self.save_checkpoint_steps = args.save_checkpoint_steps
+        self.state_save_steps = args.state_save_steps
 
         self.output_model_path = args.output_model_path
+        self.training_state_path = args.training_state_path or args.output_model_path + ".training_state.pt"
 
         self.start_time = time.time()
         self.total_loss = 0.0
+        self.last_scalars = {}
+        self.writer = None
+        self.graph_written = False
+        self.last_completed_step = self.current_step - 1
 
         self.dist_train = args.dist_train
         self.batch_size = args.batch_size
@@ -106,44 +162,144 @@ class Trainer(object):
     def report_and_reset_stats(self):
         raise NotImplementedError
 
+    def setup_tensorboard(self, args, rank):
+        if self.dist_train and rank != 0:
+            return
+        if not args.tensorboard_log_dir:
+            raise ValueError("tensorboard_log_dir is required for this training script.")
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError as exc:
+            raise ImportError("TensorBoard is required. Install it with: pip install tensorboard") from exc
+        self.writer = SummaryWriter(log_dir=args.tensorboard_log_dir)
+        self.writer.add_text("run/output_model_path", args.output_model_path, 0)
+        self.writer.add_text("run/training_state_path", self.training_state_path, 0)
+        self.writer.add_text("run/moe", "experts={}, top_k={}, balance_coef={}, z_loss_coef={}".format(
+            args.moe_experts, args.moe_top_k, args.moe_balance_coef, args.moe_z_loss_coef
+        ), 0)
+
+    def write_graph_once(self, args, model, batch):
+        if self.graph_written or args.disable_tensorboard_graph or self.writer is None:
+            return
+        try:
+            src = batch[0]
+            seg = batch[-1]
+            if args.target in ["bert", "albert"]:
+                model_input = (src, (batch[1], batch[2]), seg)
+            elif args.target == "bilm":
+                model_input = (src, (batch[1], batch[2]), seg)
+            elif args.target in ["seq2seq", "t5"]:
+                model_input = (src, (batch[1], batch[2], src), seg)
+            else:
+                model_input = (src, batch[1], seg)
+            self.writer.add_graph(unwrap_model(model), model_input)
+            self.writer.add_text("graph/status", "TensorBoard graph traced successfully.", self.current_step)
+        except Exception as exc:
+            self.writer.add_text("graph/status", "TensorBoard graph tracing failed: {}".format(repr(exc)),
+                                 self.current_step)
+        self.graph_written = True
+
+    def log_tensorboard_scalars(self, optimizer):
+        if self.writer is None:
+            return
+        step = self.current_step
+        for key, value in self.last_scalars.items():
+            self.writer.add_scalar(key, value, step)
+        if optimizer.param_groups:
+            self.writer.add_scalar("optim/lr", optimizer.param_groups[0]["lr"], step)
+
+    def log_tensorboard_parameters(self, args, model):
+        if self.writer is None or self.current_step % args.tensorboard_param_steps != 0:
+            return
+        group_param_norms = {}
+        group_grad_norms = {}
+        for name, param in unwrap_model(model).named_parameters():
+            group = parameter_group_name(name)
+            param_norm = tensor_norm(param.data)
+            group_param_norms[group] = group_param_norms.get(group, 0.0) + param_norm ** 2
+            self.writer.add_scalar("param_norm/" + sanitize_tag(name), param_norm, self.current_step)
+            if param.grad is not None:
+                grad_norm = tensor_norm(param.grad)
+                group_grad_norms[group] = group_grad_norms.get(group, 0.0) + grad_norm ** 2
+                self.writer.add_scalar("grad_norm/" + sanitize_tag(name), grad_norm, self.current_step)
+
+        for group, norm_sq in group_param_norms.items():
+            self.writer.add_scalar("param_group_norm/" + group, norm_sq ** 0.5, self.current_step)
+        for group, norm_sq in group_grad_norms.items():
+            self.writer.add_scalar("grad_group_norm/" + group, norm_sq ** 0.5, self.current_step)
+
+    def log_tensorboard_histograms(self, args, model):
+        if self.writer is None or self.current_step % args.tensorboard_histogram_steps != 0:
+            return
+        for name, param in unwrap_model(model).named_parameters():
+            if ("embedding.word_embedding" in name or
+                    "self_attn.final_linear.weight" in name or
+                    "feed_forward.moe.gate.to_gates.weight" in name or
+                    "feed_forward.moe.experts.experts.0" in name or
+                    "target" in name):
+                self.writer.add_histogram("hist_params/" + sanitize_tag(name), param.detach().float().cpu(),
+                                          self.current_step)
+                if param.grad is not None:
+                    self.writer.add_histogram("hist_grads/" + sanitize_tag(name), param.grad.detach().float().cpu(),
+                                              self.current_step)
+
     def train(self, args, gpu_id, rank, loader, model, optimizer, scheduler):
         model.train()
         loader_iter = iter(loader)
+        self.setup_tensorboard(args, rank)
 
-        for _ in tqdm.tqdm(range(self.total_steps)):
-            if self.current_step > self.total_steps:
-                break
+        try:
+            for _ in tqdm.tqdm(range(self.total_steps)):
+                if self.current_step > self.total_steps:
+                    break
 
-            batch = list(next(loader_iter))
-            self.seq_length = batch[0].size(1)
+                batch = list(next(loader_iter))
+                self.seq_length = batch[0].size(1)
 
-            if gpu_id is not None:
-                for i in range(len(batch)):
-                    batch[i] = batch[i].cuda(gpu_id)
+                if gpu_id is not None:
+                    for i in range(len(batch)):
+                        batch[i] = batch[i].cuda(gpu_id)
 
-            loss = self.forward_propagation(batch, model)
+                loss = self.forward_propagation(batch, model)
+                self.write_graph_once(args, model, batch)
 
-            if args.fp16:
-                with args.amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+                if args.fp16:
+                    with args.amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
 
-            if self.current_step % self.accumulation_steps == 0:
-                optimizer.step()
-                scheduler.step()
-                model.zero_grad()
+                if not self.dist_train or (self.dist_train and rank == 0):
+                    self.log_tensorboard_scalars(optimizer)
+                    self.log_tensorboard_parameters(args, model)
+                    self.log_tensorboard_histograms(args, model)
 
-            if self.current_step % self.report_steps == 0 and \
-                    (not self.dist_train or (self.dist_train and rank == 0)):
-                self.report_and_reset_stats()
-                self.start_time = time.time()
+                if self.current_step % self.accumulation_steps == 0:
+                    optimizer.step()
+                    scheduler.step()
+                    model.zero_grad()
 
-            if self.current_step % self.save_checkpoint_steps == 0 and \
-                    (not self.dist_train or (self.dist_train and rank == 0)):
-                save_model(model, self.output_model_path + "-" + str(self.current_step))
+                if self.current_step % self.report_steps == 0 and \
+                        (not self.dist_train or (self.dist_train and rank == 0)):
+                    self.report_and_reset_stats()
+                    self.start_time = time.time()
 
-            self.current_step += 1
+                if self.current_step % self.save_checkpoint_steps == 0 and \
+                        (not self.dist_train or (self.dist_train and rank == 0)):
+                    save_model(model, self.output_model_path + "-" + str(self.current_step))
+
+                if self.current_step % self.state_save_steps == 0 and \
+                        (not self.dist_train or (self.dist_train and rank == 0)):
+                    save_training_state(model, optimizer, scheduler, self.current_step, self.training_state_path)
+
+                self.last_completed_step = self.current_step
+                self.current_step += 1
+        finally:
+            if not self.dist_train or (self.dist_train and rank == 0):
+                save_training_state(model, optimizer, scheduler, self.last_completed_step, self.training_state_path)
+                if self.writer is not None:
+                    self.writer.flush()
+                    self.writer.close()
 
 
 class MlmTrainer(Trainer):
@@ -156,12 +312,20 @@ class MlmTrainer(Trainer):
         src, tgt, seg = batch
         loss_info = model(src, tgt, seg)
 
-        task_loss, aux_loss, full = unpack_loss(loss_info)
+        full, aux_loss = split_aux_loss(loss_info, 3)
         loss, correct, denominator = full[:3]
 
-        total_loss = task_loss
+        total_loss = loss
         if aux_loss is not None:
             total_loss = total_loss + aux_loss
+
+        aux_value = aux_loss.item() if aux_loss is not None else 0.0
+        self.last_scalars = {
+            "loss/total": total_loss.item(),
+            "loss/mlm": loss.item(),
+            "loss/moe_aux": aux_value,
+            "accuracy/mlm": correct.item() / denominator.item()
+        }
 
         self.total_loss += loss.item()
         self.total_correct += correct.item()
@@ -196,14 +360,23 @@ class NspTrainer(Trainer):
         src, tgt_mlm, tgt_sp, seg = batch
         loss_info = model(src, (tgt_mlm, tgt_sp), seg)
 
-        task_loss, aux_loss, full = unpack_loss(loss_info)
+        full, aux_loss = split_aux_loss(loss_info, 5)
         loss_mlm, loss_sp, correct_mlm, correct_sp, denominator = full[:5]
 
         total_loss = loss_sp
         if aux_loss is not None:
             total_loss = total_loss + aux_loss
 
-        self.total_loss += task_loss.item()
+        aux_value = aux_loss.item() if aux_loss is not None else 0.0
+        self.last_scalars = {
+            "loss/total": total_loss.item(),
+            "loss/mlm": loss_mlm.item(),
+            "loss/nsp": loss_sp.item(),
+            "loss/moe_aux": aux_value,
+            "accuracy/nsp": correct_sp.item() / src.size(0)
+        }
+
+        self.total_loss += total_loss.item()
         self.total_loss_sp += loss_sp.item()
         self.total_correct_sp += correct_sp.item()
         self.total_denominator += denominator.item()
@@ -243,12 +416,22 @@ class BertTrainer(Trainer):
         src, tgt_mlm, tgt_sp, seg = batch
         loss_info = model(src, (tgt_mlm, tgt_sp), seg)
 
-        task_loss, aux_loss, full = unpack_loss(loss_info)
+        full, aux_loss = split_aux_loss(loss_info, 5)
         loss_mlm, loss_sp, correct_mlm, correct_sp, denominator = full[:5]
 
-        total_loss = loss_sp
+        total_loss = loss_mlm + loss_sp
         if aux_loss is not None:
             total_loss = total_loss + aux_loss
+
+        aux_value = aux_loss.item() if aux_loss is not None else 0.0
+        self.last_scalars = {
+            "loss/total": total_loss.item(),
+            "loss/mlm": loss_mlm.item(),
+            "loss/nsp": loss_sp.item(),
+            "loss/moe_aux": aux_value,
+            "accuracy/mlm": correct_mlm.item() / denominator.item(),
+            "accuracy/nsp": correct_sp.item() / src.size(0)
+        }
 
         self.total_loss += total_loss.item()
         self.total_loss_mlm += loss_mlm.item()
@@ -301,12 +484,22 @@ class BilmTrainer(Trainer):
         src, tgt_forward, tgt_backward, seg = batch
         loss_info = model(src, (tgt_forward, tgt_backward), seg)
 
-        task_loss, aux_loss, full = unpack_loss(loss_info)
+        full, aux_loss = split_aux_loss(loss_info, 5)
         loss_forward, loss_backward, correct_forward, correct_backward, denominator = full[:5]
 
         total_loss = loss_forward + loss_backward
         if aux_loss is not None:
             total_loss = total_loss + aux_loss
+
+        aux_value = aux_loss.item() if aux_loss is not None else 0.0
+        self.last_scalars = {
+            "loss/total": total_loss.item(),
+            "loss/forward": loss_forward.item(),
+            "loss/backward": loss_backward.item(),
+            "loss/moe_aux": aux_value,
+            "accuracy/forward": correct_forward.item() / denominator.item(),
+            "accuracy/backward": correct_backward.item() / denominator.item()
+        }
 
         self.total_loss += total_loss.item()
         self.total_loss_forward += loss_forward.item()
@@ -348,12 +541,20 @@ class ClsTrainer(Trainer):
         src, tgt, seg = batch
         loss_info = model(src, tgt, seg)
 
-        task_loss, aux_loss, full = unpack_loss(loss_info)
+        full, aux_loss = split_aux_loss(loss_info, 2)
         loss, correct = full[:2]
 
-        total_loss = task_loss
+        total_loss = loss
         if aux_loss is not None:
             total_loss = total_loss + aux_loss
+
+        aux_value = aux_loss.item() if aux_loss is not None else 0.0
+        self.last_scalars = {
+            "loss/total": total_loss.item(),
+            "loss/classification": loss.item(),
+            "loss/moe_aux": aux_value,
+            "accuracy/classification": correct.item() / src.size(0)
+        }
 
         self.total_loss += total_loss.item()
         self.total_correct += correct.item()
@@ -386,12 +587,20 @@ class Seq2seqTrainer(Trainer):
         src, tgt_in, tgt_out, seg = batch
         loss_info = model(src, (tgt_in, tgt_out, src), seg)
 
-        task_loss, aux_loss, full = unpack_loss(loss_info)
+        full, aux_loss = split_aux_loss(loss_info, 3)
         loss, correct, denominator = full[:3]
 
-        total_loss = task_loss
+        total_loss = loss
         if aux_loss is not None:
             total_loss = total_loss + aux_loss
+
+        aux_value = aux_loss.item() if aux_loss is not None else 0.0
+        self.last_scalars = {
+            "loss/total": total_loss.item(),
+            "loss/seq2seq": loss.item(),
+            "loss/moe_aux": aux_value,
+            "accuracy/seq2seq": correct.item() / denominator.item()
+        }
 
         self.total_loss += total_loss.item()
         self.total_correct += correct.item()
@@ -483,6 +692,20 @@ def worker(proc_id, gpu_ranks, args, model):
         scheduler = str2scheduler[args.scheduler](optimizer, args.total_steps * args.warmup)
     else:
         scheduler = str2scheduler[args.scheduler](optimizer, args.total_steps * args.warmup, args.total_steps)
+
+    if args.training_state_path is None:
+        args.training_state_path = args.output_model_path + ".training_state.pt"
+
+    resume_path = args.resume_training_state_path
+    if resume_path is None and args.auto_resume and os.path.exists(args.training_state_path):
+        resume_path = args.training_state_path
+
+    if resume_path is not None:
+        resumed_step = load_training_state(model, optimizer, scheduler, resume_path)
+        args.resume_step = resumed_step + 1
+        print("Resumed training state from {} at step {}.".format(resume_path, resumed_step))
+    else:
+        args.resume_step = 1
 
     if args.fp16:
         try:

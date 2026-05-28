@@ -30,6 +30,11 @@ class TransformerLayer(nn.Module):
         self.dropout_1 = nn.Dropout(args.dropout)
 
         # === MoE Feed Forward ===
+        if args.moe_top_k < 2:
+            raise ValueError("st-moe-pytorch requires moe_top_k >= 2.")
+        if args.moe_top_k > args.moe_experts:
+            raise ValueError("moe_top_k must be less than or equal to moe_experts.")
+
         self.feed_forward = SparseMoEBlock(
             moe=MoE(
                 dim=args.hidden_size,
@@ -49,8 +54,6 @@ class TransformerLayer(nn.Module):
             self.layer_norm_1 = LayerNorm(args.hidden_size)
             self.layer_norm_2 = LayerNorm(args.hidden_size)
 
-        self.moe_aux_loss = 0.0
-
     def forward(self, hidden, mask, position_bias=None):
 
         if self.layernorm_positioning == "post":
@@ -60,7 +63,6 @@ class TransformerLayer(nn.Module):
             inter = self.layer_norm_1(inter + hidden)
 
             moe_ret = self.feed_forward(inter)
-            self.moe_aux_loss += moe_ret.total_aux_loss
 
             output = self.dropout_2(moe_ret.outputs)
             output = self.layer_norm_2(output + inter)
@@ -73,11 +75,10 @@ class TransformerLayer(nn.Module):
 
             normed = self.layer_norm_2(hidden)
             moe_ret = self.feed_forward(normed)
-            self.moe_aux_loss += moe_ret.total_aux_loss
 
             output = self.dropout_2(moe_ret.outputs) + hidden
 
-        return output
+        return output, moe_ret.total_aux_loss
 
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, args):
@@ -113,6 +114,11 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout_2 = nn.Dropout(args.dropout)
 
         # === MoE FFN ===
+        if args.moe_top_k < 2:
+            raise ValueError("st-moe-pytorch requires moe_top_k >= 2.")
+        if args.moe_top_k > args.moe_experts:
+            raise ValueError("moe_top_k must be less than or equal to moe_experts.")
+
         self.feed_forward = SparseMoEBlock(
             moe=MoE(
                 dim=args.hidden_size,
@@ -133,8 +139,6 @@ class TransformerDecoderLayer(nn.Module):
             self.layer_norm_1 = LayerNorm(args.hidden_size)
             self.layer_norm_2 = LayerNorm(args.hidden_size)
             self.layer_norm_3 = LayerNorm(args.hidden_size)
-
-        self.moe_aux_loss = 0.0
 
     def forward(
         self,
@@ -159,7 +163,6 @@ class TransformerDecoderLayer(nn.Module):
             mid = self.layer_norm_2(mid + query)
 
             moe_ret = self.feed_forward(mid)
-            self.moe_aux_loss += moe_ret.total_aux_loss
 
             output = self.dropout_3(moe_ret.outputs)
             output = self.layer_norm_3(output + mid)
@@ -180,8 +183,7 @@ class TransformerDecoderLayer(nn.Module):
 
             normed = self.layer_norm_3(hidden)
             moe_ret = self.feed_forward(normed)
-            self.moe_aux_loss += moe_ret.total_aux_loss
 
             output = self.dropout_3(moe_ret.outputs) + hidden
 
-        return output
+        return output, moe_ret.total_aux_loss

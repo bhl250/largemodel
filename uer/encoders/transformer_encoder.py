@@ -92,11 +92,16 @@ class TransformerEncoder(nn.Module):
 
         for i in range(self.layers_num):
             if self.parameter_sharing:
-                hidden = self.transformer(hidden, mask, position_bias=position_bias)
+                hidden, aux_loss = self.transformer(hidden, mask, position_bias=position_bias)
             else:
-                hidden = self.transformer[i](hidden, mask, position_bias=position_bias)
+                hidden, aux_loss = self.transformer[i](hidden, mask, position_bias=position_bias)
+
+            if i == 0:
+                total_aux_loss = aux_loss
+            else:
+                total_aux_loss = total_aux_loss + aux_loss
 
         if self.layernorm_positioning == "pre":
-            return self.layer_norm(hidden)
-        else:
-            return hidden
+            hidden = self.layer_norm(hidden)
+
+        return hidden, total_aux_loss

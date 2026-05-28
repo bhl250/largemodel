@@ -21,6 +21,14 @@ def model_opts(parser):
                         help="Layernorm positioning.")
     parser.add_argument("--feed_forward", choices=["dense", "gated"], default="dense",
                         help="Feed forward type, specific to transformer model.")
+    parser.add_argument("--moe_experts", type=int, default=4,
+                        help="Number of experts in MoE.")
+    parser.add_argument("--moe_top_k", type=int, default=2,
+                        help="Top-k experts per token.")
+    parser.add_argument("--moe_balance_coef", type=float, default=0.01,
+                        help="Load balance loss coefficient for MoE.")
+    parser.add_argument("--moe_z_loss_coef", type=float, default=0.001,
+                        help="Router z-loss coefficient for MoE.")
     parser.add_argument("--remove_transformer_bias", action="store_true",
                         help="Remove bias on transformer layers.")
     parser.add_argument("--layernorm", choices=["normal", "t5"], default="normal",

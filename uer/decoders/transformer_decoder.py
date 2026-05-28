@@ -71,7 +71,7 @@ class TransformerDecoder(nn.Module):
             context_position_bias = None
 
         for i in range(self.layers_num):
-            hidden = self.transformer_decoder[i](hidden, memory_bank, mask_decoder, mask_encoder, self_position_bias, context_position_bias)
+            hidden, _ = self.transformer_decoder[i](hidden, memory_bank, mask_decoder, mask_encoder, self_position_bias, context_position_bias)
 
         if self.layernorm_positioning == "pre":
             return self.layer_norm(hidden)
