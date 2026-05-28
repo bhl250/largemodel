@@ -22,7 +22,9 @@ SMOKE_TENSORBOARD_DIR = PROJECT_ROOT / "runs" / "moe_smoke_test"
 
 TRAIN_OUTPUT = PROJECT_ROOT / "models" / "moe_pre-trained_model.bin"
 TRAIN_STATE = PROJECT_ROOT / "models" / "moe_pretrain_latest_state.pt"
+TRAIN_PID = PROJECT_ROOT / "models" / "moe_pretrain.pid"
 TRAIN_TENSORBOARD_DIR = PROJECT_ROOT / "runs" / "moe_pretrain"
+BACKGROUND_LOG = TRAIN_TENSORBOARD_DIR / "background_train.log"
 
 TENSORBOARD_PORT = "6007"
 SERVICE_NAME = "etbert-moe-pretrain"
@@ -43,6 +45,16 @@ def run_capture(command):
 def run(command, env=None):
     print("\n$ " + " ".join(str(item) for item in command), flush=True)
     subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=True)
+
+
+def is_process_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def require_file(path):
@@ -185,6 +197,66 @@ def print_service_help(scope):
     print("  tensorboard URL:  http://127.0.0.1:{}".format(TENSORBOARD_PORT))
 
 
+def print_background_help(pid):
+    print("\nBackground training process started.")
+    print("Training runs outside your SSH session.")
+    print("PID:")
+    print("  {}".format(pid))
+    print("Status:")
+    print("  ps -p {}".format(pid))
+    print("Logs:")
+    print("  tail -f {}".format(BACKGROUND_LOG))
+    print("Stop:")
+    print("  kill {}".format(pid))
+    print("\nOutputs:")
+    print("  final checkpoint: {}-1000".format(TRAIN_OUTPUT))
+    print("  resumable state:  {}".format(TRAIN_STATE))
+    print("  pid file:         {}".format(TRAIN_PID))
+    print("  tensorboard dir:  {}".format(TRAIN_TENSORBOARD_DIR))
+    print("  tensorboard URL:  http://127.0.0.1:{}".format(TENSORBOARD_PORT))
+
+
+def start_detached_training_process():
+    os.chdir(PROJECT_ROOT)
+    require_file(DATASET_PATH)
+    require_file(VOCAB_PATH)
+    require_file(CONFIG_PATH)
+
+    if TRAIN_PID.exists():
+        try:
+            old_pid = int(TRAIN_PID.read_text().strip())
+        except ValueError:
+            old_pid = None
+        if old_pid is not None and is_process_running(old_pid):
+            print_background_help(old_pid)
+            print("\nTraining already appears to be running; not starting a duplicate process.")
+            return
+
+    TRAIN_TENSORBOARD_DIR.mkdir(parents=True, exist_ok=True)
+    command = [PYTHON, str(PROJECT_ROOT / "exutive.py"), "--run-training"]
+    env = training_env()
+
+    with open(BACKGROUND_LOG, "ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    TRAIN_PID.write_text(str(process.pid) + "\n")
+    time.sleep(2)
+    if process.poll() is not None:
+        print("Background training process exited immediately with code {}.".format(process.returncode))
+        print("Check log: {}".format(BACKGROUND_LOG))
+        raise RuntimeError("Detached training process failed to start.")
+
+    print_background_help(process.pid)
+
+
 def start_systemd_service():
     os.chdir(PROJECT_ROOT)
     require_file(DATASET_PATH)
@@ -213,6 +285,15 @@ def start_systemd_service():
             raise RuntimeError("Failed to run: {}".format(" ".join(command)))
 
     print_service_help(scope)
+
+
+def start_background_training():
+    try:
+        start_systemd_service()
+    except Exception as exc:
+        print("\nSystemd service is not available: {}".format(exc))
+        print("Falling back to a detached background process.")
+        start_detached_training_process()
 
 
 def base_pretrain_command(output_path, tensorboard_dir, state_path):
@@ -359,9 +440,9 @@ def main():
         return run_training_main()
 
     try:
-        start_systemd_service()
+        start_background_training()
     except Exception as exc:
-        print("\nFailed to start systemd service: {}".format(exc))
+        print("\nFailed to start background training: {}".format(exc))
         return 1
 
     return 0

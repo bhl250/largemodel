@@ -369,15 +369,27 @@ Use:
 python exutive.py
 ```
 
-This command creates or updates a systemd service named:
+This command first tries to create or update a systemd service named:
 
 ```text
 etbert-moe-pretrain.service
 ```
 
-Then it starts the service and returns immediately. The actual training process
-runs under systemd, not inside your SSH session. You can disconnect from the
-remote server after the service has started.
+If systemd is available, it starts the service and returns immediately. The
+actual training process runs under systemd, not inside your SSH session.
+
+Some school server environments are containers and do not boot with systemd as
+PID 1. In that case `systemctl` prints:
+
+```text
+System has not been booted with systemd as init system (PID 1). Can't operate.
+```
+
+`exutive.py` handles this automatically. It falls back to a detached background
+process using `start_new_session=True`, writes the process id to
+`models/moe_pretrain.pid`, and writes logs to
+`runs/moe_pretrain/background_train.log`. You can disconnect from the remote
+server after either startup mode has succeeded.
 
 The script assumes the server project has:
 
@@ -424,6 +436,15 @@ Stop training:
 
 ```bash
 systemctl stop etbert-moe-pretrain.service
+```
+
+If the script falls back to detached-process mode, use:
+
+```bash
+cat models/moe_pretrain.pid
+ps -p "$(cat models/moe_pretrain.pid)"
+tail -f runs/moe_pretrain/background_train.log
+kill "$(cat models/moe_pretrain.pid)"
 ```
 
 If the script is run by a non-root user, it uses a user-level service instead.
@@ -473,6 +494,7 @@ Outputs:
 ```text
 models/moe_pre-trained_model.bin-1000
 models/moe_pretrain_latest_state.pt
+models/moe_pretrain.pid
 runs/moe_pretrain/
 ```
 
@@ -492,6 +514,13 @@ TensorBoard event files are written under:
 
 ```text
 runs/moe_pretrain/
+```
+
+If systemd is unavailable and detached-process mode is used, the main training
+stdout/stderr log is:
+
+```text
+runs/moe_pretrain/background_train.log
 ```
 
 ## 8. Resume Behavior
