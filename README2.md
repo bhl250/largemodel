@@ -310,49 +310,33 @@ The one-command runner starts TensorBoard on:
 0.0.0.0:6007
 ```
 
-The logged information includes:
+For BERT pretraining, the main TensorBoard view has 22 primary items to watch:
+1 computation graph, 7 core scalar curves, and 14 grouped norm curves.
 
-```text
-Graph:
-  - TensorBoard computation graph
+| Count | TensorBoard item | Meaning |
+| --- | --- | --- |
+| 1 | `Graphs` | The traced model computation graph. Use this to confirm the forward path contains embedding, Transformer/MoE blocks, and the pretraining target. |
+| 1 | `loss/total` | Total optimized loss: `loss/mlm + loss/nsp + loss/moe_aux`. This is the first curve to watch for overall convergence. |
+| 1 | `loss/mlm` | Masked language modeling loss. This should trend downward during useful pretraining. |
+| 1 | `loss/nsp` | Sentence-pair / next-segment prediction loss used by the BERT target in this UER code. |
+| 1 | `loss/moe_aux` | MoE routing auxiliary loss from load balancing and router z-loss. This should stay finite and not dominate the total loss. |
+| 1 | `accuracy/mlm` | MLM token prediction accuracy on masked positions. It is usually low early in training and should improve gradually. |
+| 1 | `accuracy/nsp` | NSP / sentence-pair classification accuracy. |
+| 1 | `optim/lr` | Learning-rate schedule. Use this to check warmup and decay behavior. |
+| 7 | `param_group_norm/*` | Parameter norms for major model groups: `embedding`, `attention`, `moe_router`, `moe_experts`, `moe_ff_after`, `layer_norm`, `target_head`. Sudden spikes can indicate unstable weights. |
+| 7 | `grad_group_norm/*` | Gradient norms for the same 7 groups. Sudden spikes or all-zero gradients are the main warning signs. |
 
-Loss:
-  - loss/total
-  - loss/mlm
-  - loss/nsp
-  - loss/moe_aux
+In addition to those 22 primary items, the trainer also writes detailed
+per-parameter and histogram views:
 
-Accuracy:
-  - accuracy/mlm
-  - accuracy/nsp
-
-Optimizer:
-  - optim/lr
-
-Parameter norms:
-  - param_norm/<parameter_name>
-  - param_group_norm/embedding
-  - param_group_norm/attention
-  - param_group_norm/moe_router
-  - param_group_norm/moe_experts
-  - param_group_norm/moe_ff_after
-  - param_group_norm/layer_norm
-  - param_group_norm/target_head
-
-Gradient norms:
-  - grad_norm/<parameter_name>
-  - grad_group_norm/embedding
-  - grad_group_norm/attention
-  - grad_group_norm/moe_router
-  - grad_group_norm/moe_experts
-  - grad_group_norm/moe_ff_after
-  - grad_group_norm/layer_norm
-  - grad_group_norm/target_head
-
-Histograms:
-  - selected parameter distributions
-  - selected gradient distributions
-```
+| TensorBoard item | Write frequency | Meaning |
+| --- | --- | --- |
+| `param_norm/<parameter_name>` | every 100 steps | L2 norm of each individual parameter tensor. Use this when a grouped norm looks abnormal and you need to locate the exact layer. |
+| `grad_norm/<parameter_name>` | every 100 steps | L2 norm of each individual gradient tensor. Use this to inspect whether router/expert/attention gradients are flowing. |
+| `hist_params/*` | every 1000 steps | Distribution histogram for selected important parameters: embeddings, attention output projection, MoE router, first expert, and target head. |
+| `hist_grads/*` | every 1000 steps | Distribution histogram for selected gradients. Watch for extreme outliers, all-zero distributions, or exploding spread. |
+| `Text/run/*` | once at startup | Output path, training state path, and MoE hyperparameters. |
+| `Text/graph/status` | once at graph trace | Whether TensorBoard graph tracing succeeded. If graph tracing fails, training still continues. |
 
 If TensorBoard graph tracing fails for any reason, training continues and the
 failure reason is written as TensorBoard text under:
@@ -362,6 +346,23 @@ graph/status
 ```
 
 ## 7. One-Command Training
+
+Before starting the formal run, archive the previous 1000-step trial run:
+
+```bash
+python save_previous_run.py
+```
+
+This moves the old trial artifacts into:
+
+```text
+saved_runs/moe_pretrain_<timestamp>/
+```
+
+It saves the old model checkpoints, resumable state, PID file, TensorBoard logs,
+and background log. It also clears the active `models/moe_pretrain_latest_state.pt`
+and `runs/moe_pretrain/` locations so the formal run starts from a fresh state
+instead of resuming the 1000-step trial.
 
 Use:
 
@@ -478,30 +479,35 @@ removed.
 Then it starts main training:
 
 ```text
-steps = 1000
+steps = 100000
 batch_size = 8
 seq_length = 128
 moe_experts = 4
 moe_top_k = 2
 learning_rate = 2e-5
-report_steps = 10
-state_save_steps = 50
-save_checkpoint_steps = 1000
+report_steps = 50
+state_save_steps = 100
+save_checkpoint_steps = 5000
+tensorboard_param_steps = 100
+tensorboard_histogram_steps = 1000
 ```
 
 Outputs:
 
 ```text
-models/moe_pre-trained_model.bin-1000
+models/moe_pre-trained_model.bin-5000
+models/moe_pre-trained_model.bin-10000
+...
+models/moe_pre-trained_model.bin-100000
 models/moe_pretrain_latest_state.pt
 models/moe_pretrain.pid
 runs/moe_pretrain/
 ```
 
-The final model checkpoint for this 1000-step run is:
+The final model checkpoint for this formal 100000-step run is:
 
 ```text
-models/moe_pre-trained_model.bin-1000
+models/moe_pre-trained_model.bin-100000
 ```
 
 The resumable training state is:

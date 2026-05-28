@@ -6,6 +6,8 @@ encrypted_traffic_burst.txt
 # model files
 
 /models/
+runs/
+saved_runs/
 *.pt
 *.pth
 *.bin

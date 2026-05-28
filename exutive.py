@@ -26,6 +26,15 @@ TRAIN_PID = PROJECT_ROOT / "models" / "moe_pretrain.pid"
 TRAIN_TENSORBOARD_DIR = PROJECT_ROOT / "runs" / "moe_pretrain"
 BACKGROUND_LOG = TRAIN_TENSORBOARD_DIR / "background_train.log"
 
+TRAIN_TOTAL_STEPS = 100000
+TRAIN_BATCH_SIZE = 8
+TRAIN_SEQ_LENGTH = 128
+TRAIN_SAVE_CHECKPOINT_STEPS = 5000
+TRAIN_STATE_SAVE_STEPS = 100
+TRAIN_REPORT_STEPS = 50
+TENSORBOARD_PARAM_STEPS = 100
+TENSORBOARD_HISTOGRAM_STEPS = 1000
+
 TENSORBOARD_PORT = "6007"
 SERVICE_NAME = "etbert-moe-pretrain"
 SERVICE_DESCRIPTION = "ET-BERT MoE pretraining"
@@ -191,7 +200,7 @@ def print_service_help(scope):
     print("Stop:")
     print("  {} stop {}".format(prefix, service))
     print("\nOutputs:")
-    print("  final checkpoint: {}-1000".format(TRAIN_OUTPUT))
+    print("  final checkpoint: {}-{}".format(TRAIN_OUTPUT, TRAIN_TOTAL_STEPS))
     print("  resumable state:  {}".format(TRAIN_STATE))
     print("  tensorboard dir:  {}".format(TRAIN_TENSORBOARD_DIR))
     print("  tensorboard URL:  http://127.0.0.1:{}".format(TENSORBOARD_PORT))
@@ -209,7 +218,7 @@ def print_background_help(pid):
     print("Stop:")
     print("  kill {}".format(pid))
     print("\nOutputs:")
-    print("  final checkpoint: {}-1000".format(TRAIN_OUTPUT))
+    print("  final checkpoint: {}-{}".format(TRAIN_OUTPUT, TRAIN_TOTAL_STEPS))
     print("  resumable state:  {}".format(TRAIN_STATE))
     print("  pid file:         {}".format(TRAIN_PID))
     print("  tensorboard dir:  {}".format(TRAIN_TENSORBOARD_DIR))
@@ -319,7 +328,7 @@ def base_pretrain_command(output_path, tensorboard_dir, state_path):
         "--gpu_ranks",
         "0",
         "--seq_length",
-        "128",
+        str(TRAIN_SEQ_LENGTH),
         "--instances_buffer_size",
         "25600",
         "--moe_experts",
@@ -335,9 +344,9 @@ def base_pretrain_command(output_path, tensorboard_dir, state_path):
         "--tensorboard_log_dir",
         str(tensorboard_dir),
         "--tensorboard_param_steps",
-        "10",
+        str(TENSORBOARD_PARAM_STEPS),
         "--tensorboard_histogram_steps",
-        "200",
+        str(TENSORBOARD_HISTOGRAM_STEPS),
         "--training_state_path",
         str(state_path),
     ]
@@ -382,15 +391,15 @@ def train(env):
     command = base_pretrain_command(TRAIN_OUTPUT, TRAIN_TENSORBOARD_DIR, TRAIN_STATE)
     command.extend([
         "--batch_size",
-        "8",
+        str(TRAIN_BATCH_SIZE),
         "--total_steps",
-        "1000",
+        str(TRAIN_TOTAL_STEPS),
         "--save_checkpoint_steps",
-        "1000",
+        str(TRAIN_SAVE_CHECKPOINT_STEPS),
         "--state_save_steps",
-        "50",
+        str(TRAIN_STATE_SAVE_STEPS),
         "--report_steps",
-        "10",
+        str(TRAIN_REPORT_STEPS),
         "--auto_resume",
     ])
     run(command, env=env)
