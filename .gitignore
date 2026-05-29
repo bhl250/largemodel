@@ -6,6 +6,14 @@ encrypted_traffic_burst.txt
 # model files
 
 /models/
+/FNN/models/
+/FNN/datasets/
+/FNN/runs/
+/FNN/saved_runs/
+/MOE/models/
+/MOE/datasets/
+/MOE/runs/
+/MOE/saved_runs/
 runs/
 saved_runs/
 *.pt
