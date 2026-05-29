@@ -581,7 +581,112 @@ Then open:
 http://127.0.0.1:6007
 ```
 
-## 10. Important Notes
+## 10. Fine-Tuning
+
+After MoE pretraining finishes, CSTNET packet-level fine-tuning uses:
+
+```text
+datasets/cstnet-tls1.3/packet/train_dataset.tsv
+datasets/cstnet-tls1.3/packet/valid_dataset.tsv
+datasets/cstnet-tls1.3/packet/test_dataset.tsv
+```
+
+These files must contain `label` and `text_a` columns. The downloaded CSTNET
+packet dataset has 120 labels, with labels from 0 to 119.
+
+Start fine-tuning in the background:
+
+```bash
+python finetune_exutive.py
+```
+
+The runner uses:
+
+```text
+pretrained_model = models/moe_pre-trained_model.bin-100000
+output_model = models/moe_finetuned_cstnet_packet.bin
+epochs_num = 5
+batch_size = 32
+seq_length = 128
+learning_rate = 2e-5
+moe_experts = 4
+moe_top_k = 2
+moe_aux_weight = 0.01
+```
+
+The fine-tuning process is detached from the SSH session, like pretraining. Its
+PID and logs are:
+
+```text
+models/moe_finetune.pid
+runs/moe_finetune_cstnet_packet/background_finetune.log
+```
+
+Check status:
+
+```bash
+ps -p "$(cat models/moe_finetune.pid)"
+```
+
+Follow logs:
+
+```bash
+tail -f runs/moe_finetune_cstnet_packet/background_finetune.log
+```
+
+Stop fine-tuning:
+
+```bash
+kill "$(cat models/moe_finetune.pid)"
+```
+
+Fine-tuning TensorBoard events are written under:
+
+```text
+runs/moe_finetune_cstnet_packet/
+```
+
+The TensorBoard scalar curves include:
+
+```text
+train/loss
+train/lr
+dev/loss
+dev/acc
+dev/macro_precision
+dev/macro_recall
+dev/macro_f1
+test/loss
+test/acc
+test/macro_precision
+test/macro_recall
+test/macro_f1
+```
+
+The fine-tuning script saves the best model by dev accuracy to:
+
+```text
+models/moe_finetuned_cstnet_packet.bin
+```
+
+For inference after fine-tuning:
+
+```bash
+python inference/run_classifier_infer.py \
+  --load_model_path models/moe_finetuned_cstnet_packet.bin \
+  --vocab_path models/encryptd_vocab.txt \
+  --test_path datasets/cstnet-tls1.3/packet/nolabel_test_dataset.tsv \
+  --prediction_path datasets/cstnet-tls1.3/packet/moe_prediction.tsv \
+  --labels_num 120 \
+  --embedding word_pos_seg \
+  --encoder transformer \
+  --mask fully_visible \
+  --seq_length 128 \
+  --moe_experts 4 \
+  --moe_top_k 2
+```
+
+## 11. Important Notes
 
 The one-command runner reads the already-preprocessed file:
 

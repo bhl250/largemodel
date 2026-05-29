@@ -10,6 +10,7 @@ import torch.nn as nn
 
 uer_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(uer_dir)
+sys.path.append(os.path.join(uer_dir, "fine-tuning"))
 
 from uer.utils.constants import *
 from uer.utils import *
