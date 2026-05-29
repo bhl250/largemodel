@@ -583,21 +583,72 @@ http://127.0.0.1:6007
 
 ## 10. Fine-Tuning
 
-After MoE pretraining finishes, CSTNET packet-level fine-tuning uses:
+After MoE pretraining finishes, CSTNET packet-level fine-tuning uses the
+downloaded CSTNET TLS 1.3 packet TSV files. On the school server they should be
+placed under:
 
 ```text
 datasets/cstnet-tls1.3/packet/train_dataset.tsv
 datasets/cstnet-tls1.3/packet/valid_dataset.tsv
 datasets/cstnet-tls1.3/packet/test_dataset.tsv
+datasets/cstnet-tls1.3/packet/nolabel_test_dataset.tsv
 ```
 
-These files must contain `label` and `text_a` columns. The downloaded CSTNET
-packet dataset has 120 labels, with labels from 0 to 119.
+The absolute server paths are:
 
-Start fine-tuning in the background:
+```text
+/liuluping/cai_yihan/etbert_repo/datasets/cstnet-tls1.3/packet/train_dataset.tsv
+/liuluping/cai_yihan/etbert_repo/datasets/cstnet-tls1.3/packet/valid_dataset.tsv
+/liuluping/cai_yihan/etbert_repo/datasets/cstnet-tls1.3/packet/test_dataset.tsv
+/liuluping/cai_yihan/etbert_repo/datasets/cstnet-tls1.3/packet/nolabel_test_dataset.tsv
+```
+
+The labeled files must contain `label` and `text_a` columns. The unlabeled
+inference file only needs `text_a`. The downloaded CSTNET packet data checked
+on the server has:
+
+```text
+train_dataset.tsv: 465367 labeled rows
+valid_dataset.tsv: 58171 labeled rows
+test_dataset.tsv: 58171 labeled rows
+nolabel_test_dataset.tsv: 58171 unlabeled rows
+labels_num: 120
+label range: 0..119
+```
+
+The fine-tuning split is clean:
+
+```text
+train_dataset.tsv is used for training.
+valid_dataset.tsv is used for dev evaluation and best-model selection.
+test_dataset.tsv is used only for final test evaluation.
+nolabel_test_dataset.tsv is used only for prediction after fine-tuning.
+```
+
+It does not train on the validation or test data.
+
+Before starting fine-tuning, confirm the required files:
 
 ```bash
+cd /liuluping/cai_yihan/etbert_repo
+ls -lh models/moe_pre-trained_model.bin-100000
+ls -lh datasets/cstnet-tls1.3/packet
+head -n 3 datasets/cstnet-tls1.3/packet/train_dataset.tsv
+```
+
+Pull the latest code and start fine-tuning in the background:
+
+```bash
+cd /liuluping/cai_yihan/etbert_repo
+git pull
 python finetune_exutive.py
+tail -f runs/moe_finetune_cstnet_packet/background_finetune.log
+```
+
+The runner is:
+
+```text
+finetune_exutive.py
 ```
 
 The runner uses:
@@ -614,8 +665,13 @@ moe_top_k = 2
 moe_aux_weight = 0.01
 ```
 
-The fine-tuning process is detached from the SSH session, like pretraining. Its
-PID and logs are:
+This is the formal fine-tuning configuration, not a smoke test. The quick-test
+limits have been removed: the script no longer forces `batch_size=2`,
+`epochs_num=1`, `seq_length<=64`, or small `max_samples`.
+
+The fine-tuning process is detached from the SSH session, like pretraining. It
+uses `start_new_session=True`, so closing the SSH terminal does not stop the
+fine-tuning process. Its PID and logs are:
 
 ```text
 models/moe_finetune.pid
@@ -640,11 +696,49 @@ Stop fine-tuning:
 kill "$(cat models/moe_finetune.pid)"
 ```
 
+If the PID file exists but the process no longer exists, check the final log:
+
+```bash
+tail -n 100 runs/moe_finetune_cstnet_packet/background_finetune.log
+```
+
 Fine-tuning TensorBoard events are written under:
 
 ```text
 runs/moe_finetune_cstnet_packet/
 ```
+
+The runner starts TensorBoard with:
+
+```text
+--logdir runs
+--host 0.0.0.0
+--port 6007
+```
+
+This means pretraining and fine-tuning are both visible from the same
+TensorBoard URL:
+
+```text
+http://127.0.0.1:6007
+```
+
+The pretraining run is preserved under:
+
+```text
+runs/moe_pretrain/
+```
+
+The fine-tuning run is separate:
+
+```text
+runs/moe_finetune_cstnet_packet/
+```
+
+In TensorBoard's run selector, keep both runs enabled if you want to compare
+the old pretraining curves with the new fine-tuning curves. Starting
+fine-tuning does not delete or overwrite the pretraining TensorBoard event
+files.
 
 The TensorBoard scalar curves include:
 
@@ -663,11 +757,23 @@ test/macro_recall
 test/macro_f1
 ```
 
+Main curves to watch:
+
+```text
+train/loss: should decrease across steps.
+dev/acc and dev/macro_f1: used to judge validation quality after each epoch.
+test/acc and test/macro_f1: final held-out test quality.
+train/lr: confirms warmup/decay behavior.
+```
+
 The fine-tuning script saves the best model by dev accuracy to:
 
 ```text
 models/moe_finetuned_cstnet_packet.bin
 ```
+
+If dev accuracy ties, the script uses dev macro-F1 as the tie breaker. The final
+test metrics are printed at the end of the log.
 
 For inference after fine-tuning:
 
